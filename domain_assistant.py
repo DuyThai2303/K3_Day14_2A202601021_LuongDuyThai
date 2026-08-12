@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from dotenv import load_dotenv
-from openai import OpenAI, OpenAIError
+from google import genai
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
@@ -242,28 +242,120 @@ class TextGenerator(Protocol):
     def generate(self, prompt: str) -> str: ...
 
 
-class OpenAIGenerator:
+class GeminiGenerator:
+    """Free Gemini Generator với cơ chế tự động dò tìm mô hình (Model Auto-Discovery)."""
+
     def __init__(self, max_output_tokens: int = 300) -> None:
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        self.model = os.getenv("OPENAI_MODEL", "").strip()
+        api_key = os.getenv("GEMINI_API_KEY", os.getenv("OPENAI_API_KEY", "")).strip()
         if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is missing from .env")
-        if not self.model:
-            raise RuntimeError("OPENAI_MODEL is missing from .env")
-        self.client = OpenAI(api_key=api_key)
+            raise RuntimeError("API Key bị thiếu trong file .env (GEMINI_API_KEY hoặc OPENAI_API_KEY)")
+
+        self.client = genai.Client(api_key=api_key)
         self.max_output_tokens = max_output_tokens
+        self.model: str | None = None
+
+    def _get_working_model(self, prompt: str) -> str:
+        if self.model:
+            return self.model
+
+        # 1. Truy vấn danh sách mô hình thực tế từ Google AI Studio API
+        discovered_models: list[str] = []
+        try:
+            for m in self.client.models.list():
+                name = getattr(m, "name", str(m))
+                if name.startswith("models/"):
+                    name = name[len("models/"): ]
+                if "gemini" in name.lower():
+                    discovered_models.append(name)
+        except Exception:
+            pass
+
+        # 2. Danh sách mô hình mặc định
+        defaults = [
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-1.5-flash",
+            "gemini-1.5-flash-8b",
+            "gemini-2.5-pro",
+            "gemini-1.5-pro",
+        ]
+
+        candidates: list[str] = []
+        for m in discovered_models + defaults:
+            if m not in candidates:
+                candidates.append(m)
+
+        # 3. Thử từng mô hình xem mô hình nào phản hồi thành công
+        last_error = None
+        for model_name in candidates:
+            try:
+                res = self.client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                )
+                if res and res.text:
+                    self.model = model_name
+                    print(f"\n--> Đã kết nối thành công với mô hình Gemini: '{model_name}'", flush=True)
+                    return model_name
+            except Exception as exc:
+                last_error = exc
+                continue
+
+        raise RuntimeError(f"Tất cả mô hình Gemini đều thất bại. Lỗi cuối cùng: {last_error}")
 
     def generate(self, prompt: str) -> str:
-        response = self.client.responses.create(
-            model=self.model,
-            input=prompt,
-            temperature=0,
-            max_output_tokens=self.max_output_tokens,
-        )
-        answer = response.output_text.strip()
-        if not answer:
-            raise RuntimeError("OpenAI returned an empty answer")
-        return answer
+        model_name = self._get_working_model(prompt)
+        
+        # Thử lại tối đa 10 lần nếu gặp Rate Limit (429)
+        for attempt in range(10):
+            try:
+                response = self.client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                )
+                answer = response.text.strip() if response.text else ""
+                if answer:
+                    return answer
+            except Exception as exc:
+                err_str = str(exc)
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    # Chờ 35s để Google AI Studio reset hoàn toàn quota theo phút
+                    wait_time = 35
+                    print(
+                        f"\n[Rate Limit 429] Đã đạt trần quota phút. Tạm dừng {wait_time}s để reset (thử lần {attempt + 1}/10)...",
+                        flush=True,
+                    )
+                    time.sleep(wait_time)
+                else:
+                    raise exc
+                    
+        raise RuntimeError("Vượt quá số lần thử lại do Rate Limit.")
+        model_name = self._get_working_model(prompt)
+        
+        # Thử lại tối đa 5 lần nếu gặp Rate Limit (429)
+        for attempt in range(5):
+            try:
+                response = self.client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                )
+                answer = response.text.strip() if response.text else ""
+                if answer:
+                    return answer
+            except Exception as exc:
+                err_str = str(exc)
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    wait_time = (attempt + 1) * 6  # Chờ 6s, 12s, 18s...
+                    print(f"\n[Rate Limit 429] Tạm dừng {wait_time}s trước khi thử lại...", flush=True)
+                    time.sleep(wait_time)
+                else:
+                    raise exc
+                    
+        raise RuntimeError("Vượt quá số lần thử lại do Rate Limit.")
+
+# Aliases để tương thích với các tên gọi khác trong bài lab
+OpenAIGenerator = GeminiGenerator
+GeminiOpenAIGenerator = GeminiGenerator
 
 
 @dataclass(frozen=True)
@@ -299,7 +391,7 @@ class DomainAssistant:
         return cls(
             corpus_id,
             BM25Retriever(chunks),
-            generator if generator is not None else OpenAIGenerator(),
+            generator if generator is not None else GeminiGenerator(),
             top_k,
         )
 
@@ -451,6 +543,8 @@ def generate_actual_answers(
             f"[{bar_after}] {index:02d}/{total:02d} | {item['id']} OK "
             f"({elapsed:.1f}s, {len(response.retrieved_chunks)} chunks)"
         )
+        # Nghỉ 2 giây để tránh dính Rate Limit của Gemini Free Tier
+        time.sleep(2)
 
     return {
         "schema_version": "1.0",
@@ -458,7 +552,7 @@ def generate_actual_answers(
         "generated_at": datetime.now(UTC).isoformat(),
         "agent": {
             "name": "domain-assistant",
-            "model": model,
+            "model": assistant.generator.model or "gemini",
             "top_k": top_k,
             "prompt_version": "1.0",
         },
@@ -508,7 +602,7 @@ def main() -> int:
             json.dumps(artifact, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-    except (OSError, OpenAIError, TypeError, ValueError, RuntimeError) as exc:
+    except (OSError, TypeError, ValueError, RuntimeError) as exc:
         print(f"ERROR: {exc}")
         return 2
     print(f"Generated {len(artifact['answers'])} actual answers: {output}")
